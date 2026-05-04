@@ -249,3 +249,244 @@ stargazer(okun_basic, okun_break, okun_asym,
           omit.stat = c("ser", "f"),
           notes     = "Směrodatné chyby v závorkách. *p<0.1; **p<0.05; ***p<0.01")
 
+# PŘÍKLAD 3: Dynamický Okunův koeficient
+
+library(car)
+library(MASS)      # mvrnorm pro simulační metodu
+library(stargazer)
+
+
+# Příprava dat — tvorba posunutých (lagged) proměnných
+
+n      <- length(u_cyc)
+lag_k  <- function(x, k) c(rep(NA, k), head(as.numeric(x), n - k))
+
+MAX_P  <- 4   # maximální AR řád
+MAX_Q  <- 4   # maximální zpoždění mezery výstupu
+
+df3 <- data.frame(
+  u = as.numeric(u_cyc),
+  y = as.numeric(y_cyc),
+  D = as.numeric(D)
+)
+
+# Zpožděné proměnné: uLk = L^k(u), yLk = L^k(y)
+for (k in seq_len(MAX_P)) df3[[paste0("uL", k)]]  <- lag_k(df3$u, k)
+for (k in seq(0, MAX_Q))  df3[[paste0("yL", k)]]  <- lag_k(df3$y, k)
+
+# Interakce D × L^k(y)  a  D × L^k(u) — pro modely se zlomem
+for (k in seq(0, MAX_Q))  df3[[paste0("DyL", k)]] <- df3$D * lag_k(df3$y, k)
+for (k in seq_len(MAX_P)) df3[[paste0("DuL", k)]] <- df3$D * lag_k(df3$u, k)
+
+
+# 3.1  Výběr optimálního počtu zpoždění — rovnice (7)
+#  û_t = α_0 + Σ_{i=1}^p α_i û_{t-i} + Σ_{j=0}^q β_j ŷ_{t-j} + ε_t
+
+
+ic_grid <- data.frame(p=integer(), q=integer(), AIC=numeric(), BIC=numeric())
+
+for (p in seq_len(MAX_P)) {
+  for (q in seq(0, MAX_Q)) {
+    rhs <- paste(c(paste0("uL", seq_len(p)),
+                   paste0("yL", seq(0, q))),
+                 collapse = " + ")
+    m <- tryCatch(
+      lm(as.formula(paste("u ~", rhs)), data = df3, na.action = na.omit),
+      error = function(e) NULL
+    )
+    if (!is.null(m))
+      ic_grid <- rbind(ic_grid,
+                       data.frame(p=p, q=q, AIC=AIC(m), BIC=BIC(m)))
+  }
+}
+
+best_bic <- ic_grid[which.min(ic_grid$BIC), ]
+best_aic <- ic_grid[which.min(ic_grid$AIC), ]
+cat("BIC optimum: p =", best_bic$p, ", q =", best_bic$q, "\n")
+cat("AIC optimum: p =", best_aic$p, ", q =", best_aic$q, "\n")
+
+# Pomocná funkce pro odhad modelu (7) s volitelným rozšířením pravé strany
+fit_dyn <- function(p, q, extra = NULL) {
+  rhs <- paste(c(paste0("uL", seq_len(p)),
+                 paste0("yL", seq(0, q)),
+                 extra),
+               collapse = " + ")
+  lm(as.formula(paste("u ~", rhs)), data = df3, na.action = na.omit)
+}
+
+# Optimální modely dle BIC a AIC
+p_opt <- best_bic$p; q_opt <- best_bic$q
+
+okun_dyn     <- fit_dyn(p_opt, q_opt)                    
+okun_dyn_aic <- fit_dyn(best_aic$p, best_aic$q)          
+
+summary(okun_dyn)
+summary(okun_dyn_aic)
+
+# Výpočet dlouhodobého Okunova koeficientu
+lr_coef <- function(model, p, q,
+                    break_alpha = FALSE, break_beta = FALSE) {
+  cf <- coef(model)
+  sa <- sum(cf[paste0("uL", seq_len(p))])
+  sb <- sum(cf[paste0("yL", seq(0, q))])
+
+  if (break_alpha) {
+    du_nms <- paste0("DuL", seq_len(p))
+    sa <- sa + sum(cf[du_nms[du_nms %in% names(cf)]])
+  }
+  if (break_beta) {
+    dy_nms <- paste0("DyL", seq(0, q))
+    sb <- sb + sum(cf[dy_nms[dy_nms %in% names(cf)]])
+  }
+  sb / (1 - sa)
+}
+
+lr7_bic <- lr_coef(okun_dyn,     p_opt,        q_opt)
+lr7_aic <- lr_coef(okun_dyn_aic, best_aic$p,   best_aic$q)
+cat(sprintf("LR (BIC model, p=%d q=%d): %.3f\n", p_opt, q_opt, lr7_bic))
+cat(sprintf("LR (AIC model, p=%d q=%d): %.3f\n", best_aic$p, best_aic$q, lr7_aic))
+
+# 3.2  Strukturální zlom v rovnici (7') — varianty a) a b)
+#  Varianta a): zlom pouze v β  (koeficienty u ŷ_{t-j})
+#    û_t = α_0 + Σ α_i û_{t-i} + Σ (β_j + δ_j D_t) ŷ_{t-j} + ε_t
+#
+#  Varianta b): zlom v α i β
+#    û_t = α_0 + Σ (α_i + γ_i D_t) û_{t-i} + Σ (β_j + δ_j D_t) ŷ_{t-j} + ε_t
+
+okun_7a <- fit_dyn(p_opt, q_opt,
+                   extra = paste0("DyL", seq(0, q_opt)))
+
+okun_7b <- fit_dyn(p_opt, q_opt,
+                   extra = c(paste0("DyL", seq(0, q_opt)),
+                              paste0("DuL", seq_len(p_opt))))
+
+summary(okun_7a)
+summary(okun_7b)
+
+# Chowovy testy strukturální stability
+chow_7a <- linearHypothesis(okun_7a,
+             paste0(paste0("DyL", seq(0, q_opt)), " = 0"))
+chow_7b <- linearHypothesis(okun_7b,
+             c(paste0(paste0("DyL", seq(0, q_opt)), " = 0"),
+               paste0(paste0("DuL", seq_len(p_opt)), " = 0")))
+
+cat("\n--- Chowův test — varianta a) (zlom v β) ---\n")
+print(chow_7a)
+cat("\n--- Chowův test — varianta b) (zlom v α a β) ---\n")
+print(chow_7b)
+
+# Dlouhodobé koeficienty před a po zlomu
+lr_7a_pre  <- lr_coef(okun_7a, p_opt, q_opt, FALSE, FALSE)
+lr_7a_post <- lr_coef(okun_7a, p_opt, q_opt, FALSE, TRUE)
+lr_7b_pre  <- lr_coef(okun_7b, p_opt, q_opt, FALSE, FALSE)
+lr_7b_post <- lr_coef(okun_7b, p_opt, q_opt, TRUE,  TRUE)
+
+cat(sprintf("\nVar. a)  LR před: %.3f  |  LR po: %.3f\n", lr_7a_pre, lr_7a_post))
+cat(sprintf("Var. b)  LR před: %.3f  |  LR po: %.3f\n", lr_7b_pre, lr_7b_post))
+
+# ---------------------------------------------------------------
+# 3.3  Plný strukturální zlom — všechny koeficienty včetně konstanty
+# ---------------------------------------------------------------
+
+okun_full <- fit_dyn(p_opt, q_opt,
+                     extra = c("D",
+                               paste0("DyL", seq(0, q_opt)),
+                               paste0("DuL", seq_len(p_opt))))
+summary(okun_full)
+
+chow_full <- linearHypothesis(okun_full,
+               c("D = 0",
+                 paste0(paste0("DyL", seq(0, q_opt)), " = 0"),
+                 paste0(paste0("DuL", seq_len(p_opt)), " = 0")))
+cat("\n--- Chowův test — plný zlom ---\n")
+print(chow_full)
+
+lr_full_pre  <- lr_coef(okun_full, p_opt, q_opt, FALSE, FALSE)
+lr_full_post <- lr_coef(okun_full, p_opt, q_opt, TRUE,  TRUE)
+cat(sprintf("Plný zlom  LR před: %.3f  |  LR po: %.3f\n", lr_full_pre, lr_full_post))
+
+
+# 3.4  Směrodatné odchylky LR koeficientů
+# Deltova metoda a simulační (parametrický bootstrap)
+
+
+B <- 10000   # počet Monte Carlo výběrů
+set.seed(42)
+
+# Numerický gradient pro Deltovu metodu 
+delta_se <- function(model, lr_fn, h = 1e-6) {
+  cf   <- coef(model)
+  Sig  <- vcov(model)
+  lr0  <- lr_fn(cf)
+  grad <- vapply(seq_along(cf), function(i) {
+    cf2    <- cf
+    cf2[i] <- cf2[i] + h
+    (lr_fn(cf2) - lr0) / h
+  }, numeric(1))
+  sqrt(as.numeric(t(grad) %*% Sig %*% grad))
+}
+
+# --- Simulační metoda ---
+sim_se <- function(model, lr_fn, B = 10000) {
+  cf    <- coef(model)
+  Sig   <- vcov(model)
+  draws <- MASS::mvrnorm(B, mu = cf, Sigma = Sig)
+  lrs   <- apply(draws, 1, function(th) {
+    names(th) <- names(cf)
+    tryCatch(lr_fn(th), error = function(e) NA_real_)
+  })
+  sd(lrs, na.rm = TRUE)
+}
+
+# Uzávěry (closures) pro každý LR koeficient 
+make_lr <- function(p, q, ba = FALSE, bb = FALSE) {
+  function(theta) {
+    sa <- sum(theta[paste0("uL", seq_len(p))])
+    sb <- sum(theta[paste0("yL", seq(0, q))])
+    if (ba) {
+      du_nms <- paste0("DuL", seq_len(p))
+      sa <- sa + sum(theta[du_nms[du_nms %in% names(theta)]])
+    }
+    if (bb) {
+      dy_nms <- paste0("DyL", seq(0, q))
+      sb <- sb + sum(theta[dy_nms[dy_nms %in% names(theta)]])
+    }
+    sb / (1 - sa)
+  }
+}
+
+# Seznam modelů a příslušných LR funkcí
+specs <- list(
+  list(model=okun_dyn,  fn=make_lr(p_opt,q_opt,F,F),  label="Základní (BIC)"),
+  list(model=okun_7a,   fn=make_lr(p_opt,q_opt,F,F),  label="Zlom-β, před"),
+  list(model=okun_7a,   fn=make_lr(p_opt,q_opt,F,T),  label="Zlom-β, po"),
+  list(model=okun_7b,   fn=make_lr(p_opt,q_opt,F,F),  label="Zlom-αβ, před"),
+  list(model=okun_7b,   fn=make_lr(p_opt,q_opt,T,T),  label="Zlom-αβ, po"),
+  list(model=okun_full, fn=make_lr(p_opt,q_opt,F,F),  label="Plný zlom, před"),
+  list(model=okun_full, fn=make_lr(p_opt,q_opt,T,T),  label="Plný zlom, po")
+)
+
+se_tbl <- do.call(rbind, lapply(specs, function(s) {
+  lr_val <- s$fn(coef(s$model))
+  data.frame(
+    Model    = s$label,
+    LR       = round(lr_val,  3),
+    SE_Delta = round(delta_se(s$model, s$fn), 3),
+    SE_Sim   = round(sim_se(s$model,   s$fn, B), 3),
+    stringsAsFactors = FALSE
+  )
+}))
+
+cat("\n=== Směrodatné odchylky LR koeficientů ===\n")
+print(se_tbl, row.names = FALSE)
+
+# Stargazer výstup základní tabulky modelů 
+stargazer(okun_dyn, okun_7a, okun_7b, okun_full,
+          type           = "text",
+          title          = "Dynamické modely Okunova vztahu — Německo 1995Q1–2018Q4",
+          dep.var.labels = "Mezera nezaměstnanosti",
+          column.labels  = c("Základ. (7)", "Zlom-β (7'a)",
+                             "Zlom-αβ (7'b)", "Plný zlom"),
+          omit.stat      = c("ser", "f"),
+          notes          = paste0("Sm. chyby v závorkách. ",
+                                  "*p<0.1; **p<0.05; ***p<0.01"))
